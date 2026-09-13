@@ -33,6 +33,25 @@ systemctl enable "wpa_supplicant@${IFACE}" >/dev/null 2>&1 || true
 systemctl restart "wpa_supplicant@${IFACE}"
 ip link set "$IFACE" up
 
+# rtw88 and several other drivers enable power save by default; it can cost
+# more than 10x throughput. Measured on an 8822CE: 6 KB/s -> 82 KB/s.
+cat > /etc/systemd/system/wifi-powersave-off@.service <<UNIT
+[Unit]
+Description=Disable Wi-Fi power save on %i
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iw dev %i set power_save off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now "wifi-powersave-off@${IFACE}" >/dev/null 2>&1 || true
+iw dev "$IFACE" set power_save off 2>/dev/null || true
+
 echo "waiting for association..."
 for i in $(seq 1 25); do
   iw dev "$IFACE" link 2>/dev/null | grep -q '^Connected' && break
@@ -41,6 +60,7 @@ done
 
 if iw dev "$IFACE" link | grep -q '^Connected'; then
   iw dev "$IFACE" link | grep -E 'Connected|SSID|freq|signal|bitrate'
+  echo "power save: $(iw dev "$IFACE" get power_save | awk '{print $3}')"
   echo "ASSOCIATED"
 else
   echo "NOT ASSOCIATED - diagnose with:"

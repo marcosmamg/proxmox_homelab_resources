@@ -450,6 +450,47 @@ Connected to aa:bb:cc:dd:ee:ff (on wlp3s0)
         rx bitrate: 270.0 MBit/s
 ```
 
+### Turn off power save
+
+`03-wifi-connect.sh` does this for you, but it's worth knowing about because the
+effect is enormous and nothing warns you:
+
+```bash
+iw dev wlp3s0 get power_save      # ships as "on"
+iw dev wlp3s0 set power_save off
+```
+
+Measured on an 8822CE with an excellent signal: **6 KB/s with power save on, 82
+KB/s with it off.** Same link, same signal, 13x difference.
+
+<details>
+<summary><b>📚 Why Wi-Fi power save wrecks throughput</b></summary>
+
+Power save exists for laptops and phones. The client tells the AP "I'm sleeping,
+buffer my traffic", then wakes periodically to collect it. The radio spends most
+of its time powered down, which saves real battery.
+
+On a server it is pure cost. Every sleep cycle adds latency to arriving packets,
+and TCP is exquisitely sensitive to latency variation: the congestion window is
+sized from round-trip time, so a link that randomly delays packets by tens of
+milliseconds looks congested. TCP backs off, throughput collapses, and the link
+still reports its full negotiated rate because the *radio* is fine — it's just
+asleep half the time.
+
+That's the signature to recognize: `iw dev IFACE link` shows a healthy bitrate
+(hundreds of Mbit/s), signal is strong, retries are zero, and actual transfers
+crawl.
+
+It is on by default in `rtw88` and several other drivers, and nothing in the
+Proxmox UI surfaces it. Make it persistent with a systemd unit, because it
+resets whenever the interface is recreated:
+
+```bash
+systemctl enable --now wifi-powersave-off@wlp3s0
+```
+
+</details>
+
 Prove the radio has a real path out, without disturbing the live default route:
 
 ```bash
@@ -664,6 +705,48 @@ dhcp-range=10.10.10.50,10.10.10.200,12h
 dhcp-option=option:router,10.10.10.1
 dhcp-option=option:dns-server,1.1.1.1,8.8.8.8
 ```
+
+The cutover script also installs `ensure-default-route.service`, which exists to
+work around a race that will otherwise strand you:
+
+<details>
+<summary><b>📚 The boot race that leaves you with no default route</b></summary>
+
+`ifupdown2` brings interfaces up in parallel and configures each as soon as the
+device exists. For Ethernet that's fine — the device exists and has carrier
+almost immediately.
+
+Wi-Fi doesn't work that way. The device exists at boot, but it has **no carrier
+until wpa_supplicant finishes associating**, which takes seconds and varies with
+band, signal, and how busy the AP is. If `ifupdown2` reaches the `gateway` line
+first, the route add fails because the interface has no carrier — and nothing
+retries. The interface then associates normally, gets its address, and the host
+sits there with a perfectly good link and no route off its own subnet:
+
+```
+$ ip route
+10.10.10.0/24 dev vmbr0 proto kernel scope link src 10.10.10.1
+192.168.0.0/24 dev wlp3s0 proto kernel scope link src 192.168.0.100
+                                          <-- no default route
+
+$ ping 1.1.1.1
+ping: connect: Network is unreachable
+```
+
+`/etc/network/interfaces` looks correct throughout, which makes this confusing to
+diagnose. The gateway line is right there; it just never got applied.
+
+This is timing-dependent, so it can work for weeks and then start failing after
+you switch bands or move the machine — anything that makes association slower.
+
+The fix is a oneshot unit that waits for carrier and then installs the route if
+it's missing. It's idempotent, so it costs nothing when `ifupdown2` won the race:
+
+```bash
+systemctl status ensure-default-route
+```
+
+</details>
 
 Then verify and unplug:
 
@@ -1070,6 +1153,9 @@ a GRUB entry to fall back to.
 | SSID missing from scan | Missing regdb, or hidden SSID | `apt install wireless-regdb`; add `scan_ssid=1` |
 | `failed to load regulatory.db` | `wireless-regdb` missing | `apt install wireless-regdb` |
 | `Not connected` after reboot | Unit not enabled | `systemctl enable wpa_supplicant@IFACE` |
+| Strong signal, high bitrate, KB/s throughput | Wi-Fi power save | `iw dev IFACE set power_save off` |
+| `Network is unreachable` after reboot, link fine | Default-route race at boot | `systemctl enable ensure-default-route` |
+| Heavy ping loss to the router only | Router deprioritizes ICMP to itself | Ping another client instead |
 | Guests get an IP, no internet | Forwarding or NAT rule | `sysctl net.ipv4.ip_forward`; `iptables -t nat -S POSTROUTING` |
 | Guests get no IP | dnsmasq not bound to vmbr0 | `bind-dynamic`; `journalctl -u dnsmasq` |
 | `:53` on your LAN address | `bind-interfaces` with no carrier | `bind-dynamic` + `listen-address` |
@@ -1096,6 +1182,41 @@ Start at 1 and stop at the first failure — everything above it is noise until
 that layer is fixed. Layer 6 belongs on the list precisely because it's invisible
 otherwise: it breaks TLS, package signatures, and auth tokens while every network
 test passes.
+
+### Measuring a slow link without fooling yourself
+
+Several hours can disappear into optimizing the wrong component. Three traps,
+all of which we walked into:
+
+**Don't measure loss by pinging your own router.** Many consumer routers rate-limit
+or deprioritize ICMP addressed *to themselves* while forwarding data normally.
+A router showing 20% ping loss can be passing TCP perfectly. Ping **another
+client on the same AP** instead — that exercises the same radio path with no
+router CPU involved:
+
+```bash
+ping -c 100 -i 0.2 <another-device-on-your-lan> | tail -2
+```
+
+**Don't trust a single speed-test endpoint.** `speed.cloudflare.com/__down`
+returned `0 B/s` repeatedly in testing while real downloads worked fine. Use an
+actual file from a mirror you'll really use, and compare at least two sources.
+
+**Test from a second machine before blaming the host.** The decisive measurement
+is whether another device on the same network hits the same ceiling:
+
+```bash
+# from a laptop on the same Wi-Fi
+curl -s -o /dev/null -r 0-10000000 -w '%{speed_download} B/s\n' <same-url>
+```
+
+If both machines land within a few percent of each other, the bottleneck is
+upstream — the WAN link or the mirror — and no amount of driver tuning will move
+it. That single test would have saved a long detour through power save, ASPM,
+band switching, and antenna theories.
+
+Order the checks cheapest-first: another client's throughput, then a second
+mirror, then the driver.
 
 ### Useful commands
 

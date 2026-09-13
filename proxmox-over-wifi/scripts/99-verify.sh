@@ -19,6 +19,16 @@ systemctl is-enabled "wpa_supplicant@${IFACE}" 2>/dev/null | grep -q enabled \
   && ok "wpa_supplicant@${IFACE} enabled at boot" \
   || bad "wpa_supplicant@${IFACE} NOT enabled - host will not come back after reboot"
 
+# Power save on this driver can cost 10x+ throughput.
+PS=$(iw dev "$IFACE" get power_save 2>/dev/null | awk '{print $3}')
+[ "$PS" = "off" ] && ok "power save off" || bad "power save is '$PS' - expect badly degraded throughput"
+systemctl is-enabled "wifi-powersave-off@${IFACE}" 2>/dev/null | grep -q enabled \
+  && ok "power-save-off unit enabled at boot" \
+  || bad "power-save-off unit NOT enabled - it will come back on after reboot"
+systemctl is-enabled ensure-default-route 2>/dev/null | grep -q enabled \
+  && ok "ensure-default-route enabled at boot" \
+  || bad "ensure-default-route NOT enabled - a slow association can leave you with no route"
+
 hr "interfaces"
 ip -br a
 ip -br a show "$IFACE" | grep -q ' UP ' && ok "$IFACE up" || bad "$IFACE down"

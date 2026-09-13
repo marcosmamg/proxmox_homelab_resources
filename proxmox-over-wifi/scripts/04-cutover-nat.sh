@@ -52,8 +52,44 @@ dhcp-option=option:dns-server,${DNS1},${DNS2}
 DNSCONF
 systemctl restart dnsmasq
 
+# ifupdown2 configures the interface as soon as it exists, which can be before
+# wpa_supplicant has associated. With no carrier the default-route add fails
+# silently and is never retried, so the host boots with no route off-subnet.
+cat > /usr/local/sbin/ensure-default-route.sh <<ROUTESH
+#!/bin/bash
+IFACE="${IFACE}"
+GW="${GATEWAY}"
+
+for i in \$(seq 1 60); do
+  [ "\$(cat /sys/class/net/\$IFACE/operstate 2>/dev/null)" = "up" ] && break
+  sleep 1
+done
+
+ip route show default | grep -q "dev \$IFACE" || ip route add default via "\$GW" dev "\$IFACE"
+ip route show default
+ROUTESH
+chmod +x /usr/local/sbin/ensure-default-route.sh
+
+cat > /etc/systemd/system/ensure-default-route.service <<UNIT
+[Unit]
+Description=Ensure default route once Wi-Fi associates
+After=network-online.target wpa_supplicant@${IFACE}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ensure-default-route.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable ensure-default-route >/dev/null 2>&1 || true
+
 ifreload -a
 sleep 3
+systemctl start ensure-default-route || true
 ip -br a
 ip route get 1.1.1.1
 
