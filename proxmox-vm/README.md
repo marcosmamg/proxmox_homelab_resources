@@ -477,7 +477,7 @@ moved — on the host:
 
 ```bash
 cat >> /etc/dnsmasq.d/vmbr0.conf <<'EOF'
-dhcp-host=BC:24:11:XX:XX:XX,10.10.10.50,appsumo
+dhcp-host=BC:24:11:XX:XX:XX,10.10.10.50,debian-vm
 EOF
 systemctl restart dnsmasq
 ```
